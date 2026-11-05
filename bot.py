@@ -98,10 +98,10 @@ class ChannelBot(discord.Client):
 
         self.log_queue = asyncio.Queue(maxsize=10000)
         self.background_tasks = []
-        self.http = None
+        self.panel_session = None
 
     async def setup_hook(self):
-        self.http = aiohttp.ClientSession(
+        self.panel_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20)
         )
 
@@ -163,7 +163,7 @@ class ChannelBot(discord.Client):
         }
 
         try:
-            async with self.http.post(
+            async with self.panel_session.post(
                 url,
                 headers=headers,
                 json=payload,
@@ -345,8 +345,8 @@ class ChannelBot(discord.Client):
             return_exceptions=True,
         )
 
-        if self.http is not None:
-            await self.http.close()
+        if self.panel_session is not None:
+            await self.panel_session.close()
 
         await super().close()
 
