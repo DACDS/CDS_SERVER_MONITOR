@@ -4,25 +4,47 @@ import logging
 import os
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
+
+
+# ---------------- Configuration ----------------
 
 BASE_DIR = Path(__file__).resolve().parent
 
 TOKEN_FILE = Path(
     os.getenv("TOKEN_FILE", str(BASE_DIR / "token.txt"))
 )
+
 CHANNELS_FILE = Path(
     os.getenv("CHANNELS_FILE", str(BASE_DIR / "channels.txt"))
 )
+
 LOG_FILE = os.getenv(
     "MINECRAFT_LOG",
     "/minecraft-logs/latest.log",
 )
 
+PTERO_URL = os.getenv("PTERO_URL", "").rstrip("/")
+
+PTERO_SERVER_ID = os.getenv("PTERO_SERVER_ID", "").strip()
+
+PTERO_API_KEY_FILE = Path(
+    os.getenv(
+        "PTERO_API_KEY_FILE",
+        "/run/secrets/ptero_api_key",
+    )
+)
+
+# Restrict ALL commands and log destinations to your Discord server.
+DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("minecraft_bot")
 
+
+# ---------------- Saved channels ----------------
 
 def load_channels():
     if not CHANNELS_FILE.exists():
@@ -45,8 +67,27 @@ def save_channels(channels):
         "".join(f"{channel_id}\n" for channel_id in sorted(channels)),
         encoding="utf-8",
     )
+
     temporary.replace(CHANNELS_FILE)
 
+
+class PanelError(Exception):
+    pass
+
+
+class RestrictedCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction):
+        if interaction.guild_id != DISCORD_GUILD_ID:
+            await interaction.response.send_message(
+                "This bot is restricted to its configured Discord server.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+
+# ---------------- Bot ----------------
 
 class ChannelBot(discord.Client):
     def __init__(self):
@@ -55,15 +96,20 @@ class ChannelBot(discord.Client):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        self.tree = app_commands.CommandTree(self)
+        self.tree = RestrictedCommandTree(self)
         self.enabled_channels = load_channels()
         self.channels_lock = asyncio.Lock()
+        self.power_lock = asyncio.Lock()
 
-        # Bounded memory buffer, not permanent storage.
         self.log_queue = asyncio.Queue(maxsize=10000)
         self.background_tasks = []
+        self.http = None
 
     async def setup_hook(self):
+        self.http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20)
+        )
+
         await self.tree.sync()
 
         self.background_tasks = [
@@ -71,10 +117,113 @@ class ChannelBot(discord.Client):
             asyncio.create_task(self.forward_logs()),
         ]
 
+        for task in self.background_tasks:
+            task.add_done_callback(self.background_task_done)
+
+    def background_task_done(self, task):
+        if task.cancelled():
+            return
+
+        error = task.exception()
+
+        if error is not None:
+            logger.error(
+                "Background task stopped unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
     async def on_ready(self):
         logger.info("Logged in as %s", self.user)
-        logger.info("Watching %s", LOG_FILE)
+        logger.info("Watching: %s", LOG_FILE)
         logger.info("Saved channels: %s", len(self.enabled_channels))
+
+    # ---------------- Pterodactyl API ----------------
+
+    async def panel_post(self, endpoint, payload):
+        if not PTERO_URL or not PTERO_SERVER_ID:
+            raise PanelError(
+                "Set PTERO_URL and PTERO_SERVER_ID first."
+            )
+
+        try:
+            api_key = PTERO_API_KEY_FILE.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            raise PanelError(
+                "Cannot read the Pterodactyl API key file."
+            ) from None
+
+        if not api_key:
+            raise PanelError("The Pterodactyl API key file is empty.")
+
+        url = (
+            f"{PTERO_URL}/api/client/servers/"
+            f"{PTERO_SERVER_ID}/{endpoint}"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+
+        try:
+            async with self.http.post(
+                url,
+                headers=headers,
+                json=payload,
+                allow_redirects=False,
+            ) as response:
+                if 200 <= response.status < 300:
+                    return
+
+                messages = {
+                    401: "Pterodactyl rejected the API key.",
+                    403: "The API account lacks the required permission.",
+                    404: "Server/API endpoint not found. Check the panel URL and server ID.",
+                    409: "The server cannot perform that action in its current state.",
+                    422: "Pterodactyl rejected the request parameters.",
+                    429: "Pterodactyl rate limit reached. Try again later.",
+                }
+
+                raise PanelError(
+                    messages.get(
+                        response.status,
+                        f"Pterodactyl returned HTTP {response.status}.",
+                    )
+                )
+
+        except asyncio.TimeoutError:
+            raise PanelError(
+                "The request timed out. Check the panel before retrying; "
+                "the action may already have been accepted."
+            ) from None
+        except aiohttp.ClientError:
+            raise PanelError(
+                "Could not connect to the Pterodactyl panel. "
+                "Check networking, the URL, and its TLS certificate."
+            ) from None
+
+    async def set_power(self, signal):
+        if signal not in {"start", "stop"}:
+            raise ValueError("Unsupported power signal")
+
+        async with self.power_lock:
+            await self.panel_post("power", {"signal": signal})
+
+    async def send_console_command(self, command):
+        """For future Minecraft console features, not Linux shell commands."""
+        command = command.strip()
+
+        if not command:
+            raise ValueError("Console command cannot be empty")
+
+        if "\n" in command or "\r" in command:
+            raise ValueError("Only one console command is allowed")
+
+        await self.panel_post("command", {"command": command})
+
+    # ---------------- Log reader ----------------
 
     async def read_log(self):
         await self.wait_until_ready()
@@ -108,11 +257,7 @@ class ChannelBot(discord.Client):
                     if not self.enabled_channels:
                         continue
 
-                    # Prevent log contents from closing the code block.
-                    line = line.replace("```", "'''")
-
-                    # Split unusually long lines into safe message pieces.
-                    text = line + "\n"
+                    text = line.replace("```", "'''") + "\n"
 
                     for start in range(0, len(text), 1800):
                         await self.log_queue.put(
@@ -127,6 +272,7 @@ class ChannelBot(discord.Client):
                 if process is not None and process.returncode is None:
                     with contextlib.suppress(ProcessLookupError):
                         process.terminate()
+
                     await process.wait()
 
             await asyncio.sleep(5)
@@ -143,7 +289,6 @@ class ChannelBot(discord.Client):
             )
             pending = None
 
-            # Collect nearby log lines into fewer Discord messages.
             await asyncio.sleep(2)
             await self.wait_until_ready()
 
@@ -157,7 +302,6 @@ class ChannelBot(discord.Client):
                 batch += piece
 
             for channel_id in list(self.enabled_channels):
-                # Respect /disable while earlier sends are in progress.
                 if channel_id not in self.enabled_channels:
                     continue
 
@@ -173,6 +317,10 @@ class ChannelBot(discord.Client):
                     ):
                         continue
 
+                    # Also check destinations loaded from the saved file.
+                    if channel.guild.id != DISCORD_GUILD_ID:
+                        continue
+
                     await channel.send(
                         f"```text\n{batch}\n```",
                         allowed_mentions=discord.AllowedMentions.none(),
@@ -180,17 +328,17 @@ class ChannelBot(discord.Client):
 
                 except discord.Forbidden:
                     logger.warning(
-                        "Missing access/send permission: %s",
+                        "Missing Discord channel permissions: %s",
                         channel_id,
                     )
                 except discord.NotFound:
                     logger.warning(
-                        "Channel no longer exists: %s",
+                        "Discord channel no longer exists: %s",
                         channel_id,
                     )
                 except discord.HTTPException:
                     logger.exception(
-                        "Could not send log batch to %s",
+                        "Failed sending logs to channel %s",
                         channel_id,
                     )
 
@@ -203,18 +351,21 @@ class ChannelBot(discord.Client):
             return_exceptions=True,
         )
 
+        if self.http is not None:
+            await self.http.close()
+
         await super().close()
 
 
 bot = ChannelBot()
 
 
-async def update_channel(interaction, enable):
-    channel_id = interaction.channel_id
+# ---------------- Enable / disable ----------------
 
-    if interaction.guild_id is None or channel_id is None:
+async def update_channel(interaction, enable):
+    if interaction.channel_id is None:
         await interaction.response.send_message(
-            "Run this command in a server channel.",
+            "Run this in a server channel.",
             ephemeral=True,
         )
         return
@@ -225,16 +376,16 @@ async def update_channel(interaction, enable):
         updated = bot.enabled_channels.copy()
 
         if enable:
-            updated.add(channel_id)
+            updated.add(interaction.channel_id)
         else:
-            updated.discard(channel_id)
+            updated.discard(interaction.channel_id)
 
         try:
             await asyncio.to_thread(save_channels, updated)
         except OSError:
-            logger.exception("Could not save channels")
+            logger.exception("Could not save channel list")
             await interaction.followup.send(
-                "Couldn't save channels. Check folder permissions.",
+                "Could not save channels. Check folder permissions.",
                 ephemeral=True,
             )
             return
@@ -271,16 +422,86 @@ async def disable(interaction: discord.Interaction):
     await update_channel(interaction, False)
 
 
+# ---------------- Start / stop ----------------
+
+@bot.tree.command(
+    name="start",
+    description="Start the Minecraft server.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def start(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await bot.set_power("start")
+    except PanelError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    logger.info(
+        "START requested by Discord user %s",
+        interaction.user.id,
+    )
+
+    await interaction.followup.send(
+        "Start request accepted. Watch the logs for startup progress.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="stop",
+    description="Gracefully stop the Minecraft server.",
+)
+@app_commands.describe(
+    confirm="Set to True to confirm stopping the Minecraft server."
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def stop(interaction: discord.Interaction, confirm: bool):
+    if not confirm:
+        await interaction.response.send_message(
+            "Nothing changed. Use /stop confirm:True to stop the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await bot.set_power("stop")
+    except PanelError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    logger.info(
+        "STOP requested by Discord user %s",
+        interaction.user.id,
+    )
+
+    await interaction.followup.send(
+        "Graceful stop request accepted. Watch the logs for shutdown progress.",
+        ephemeral=True,
+    )
+
+
+# ---------------- Command errors ----------------
+
 @bot.tree.error
 async def command_error(interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
-        message = "You need Manage Channels permission."
+        message = "You do not have permission to use this command."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "Run this command in the configured Discord server."
     else:
         logger.error(
-            "Command failed",
+            "Discord command failed",
             exc_info=(type(error), error, error.__traceback__),
         )
-        message = "Command failed. Check the bot's terminal."
+        message = "Command failed. Check the bot's container logs."
 
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
@@ -291,13 +512,20 @@ async def command_error(interaction, error):
         )
 
 
+# ---------------- Startup ----------------
+
 if __name__ == "__main__":
+    if not DISCORD_GUILD_ID:
+        raise SystemExit(
+            "Set DISCORD_GUILD_ID to your Discord server ID."
+        )
+
     if not TOKEN_FILE.exists():
-        raise SystemExit(f"Missing token file: {TOKEN_FILE}")
+        raise SystemExit(f"Missing Discord token file: {TOKEN_FILE}")
 
     token = TOKEN_FILE.read_text(encoding="utf-8").strip()
 
     if not token:
-        raise SystemExit("Token file is empty.")
+        raise SystemExit("Discord token file is empty.")
 
     bot.run(token)
