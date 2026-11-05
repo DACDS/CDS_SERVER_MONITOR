@@ -1,3 +1,8 @@
-
-channels.txt
+.git/
+.env
 token.txt
+ptero_api_key.txt
+channels.txt
+data/
+__pycache__/
+*.pyc

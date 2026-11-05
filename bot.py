@@ -27,7 +27,6 @@ LOG_FILE = os.getenv(
 )
 
 PTERO_URL = os.getenv("PTERO_URL", "").rstrip("/")
-
 PTERO_SERVER_ID = os.getenv("PTERO_SERVER_ID", "").strip()
 
 PTERO_API_KEY_FILE = Path(
@@ -36,9 +35,6 @@ PTERO_API_KEY_FILE = Path(
         "/run/secrets/ptero_api_key",
     )
 )
-
-# Restrict ALL commands and log destinations to your Discord server.
-DISCORD_GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("minecraft_bot")
@@ -50,17 +46,27 @@ def load_channels():
     if not CHANNELS_FILE.exists():
         return set()
 
-    return {
-        int(line.strip())
-        for line in CHANNELS_FILE.read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if line.strip()
-    }
+    channels = set()
+
+    for line in CHANNELS_FILE.read_text(
+        encoding="utf-8"
+    ).splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        try:
+            channels.add(int(line))
+        except ValueError:
+            logger.warning("Ignoring invalid channel ID: %r", line)
+
+    return channels
 
 
 def save_channels(channels):
     CHANNELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
     temporary = CHANNELS_FILE.with_suffix(".tmp")
 
     temporary.write_text(
@@ -75,18 +81,6 @@ class PanelError(Exception):
     pass
 
 
-class RestrictedCommandTree(app_commands.CommandTree):
-    async def interaction_check(self, interaction):
-        if interaction.guild_id != DISCORD_GUILD_ID:
-            await interaction.response.send_message(
-                "This bot is restricted to its configured Discord server.",
-                ephemeral=True,
-            )
-            return False
-
-        return True
-
-
 # ---------------- Bot ----------------
 
 class ChannelBot(discord.Client):
@@ -96,7 +90,8 @@ class ChannelBot(discord.Client):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        self.tree = RestrictedCommandTree(self)
+        self.tree = app_commands.CommandTree(self)
+
         self.enabled_channels = load_channels()
         self.channels_lock = asyncio.Lock()
         self.power_lock = asyncio.Lock()
@@ -179,8 +174,8 @@ class ChannelBot(discord.Client):
 
                 messages = {
                     401: "Pterodactyl rejected the API key.",
-                    403: "The API account lacks the required permission.",
-                    404: "Server/API endpoint not found. Check the panel URL and server ID.",
+                    403: "The API account lacks permission for this action.",
+                    404: "Server or API endpoint not found. Check the panel URL and server ID.",
                     409: "The server cannot perform that action in its current state.",
                     422: "Pterodactyl rejected the request parameters.",
                     429: "Pterodactyl rate limit reached. Try again later.",
@@ -195,13 +190,13 @@ class ChannelBot(discord.Client):
 
         except asyncio.TimeoutError:
             raise PanelError(
-                "The request timed out. Check the panel before retrying; "
+                "Request timed out. Check the panel before retrying; "
                 "the action may already have been accepted."
             ) from None
         except aiohttp.ClientError:
             raise PanelError(
-                "Could not connect to the Pterodactyl panel. "
-                "Check networking, the URL, and its TLS certificate."
+                "Could not connect to the panel. "
+                "Check its URL, networking, and TLS certificate."
             ) from None
 
     async def set_power(self, signal):
@@ -212,7 +207,7 @@ class ChannelBot(discord.Client):
             await self.panel_post("power", {"signal": signal})
 
     async def send_console_command(self, command):
-        """For future Minecraft console features, not Linux shell commands."""
+        """Send a Minecraft console command, not a Linux shell command."""
         command = command.strip()
 
         if not command:
@@ -257,8 +252,10 @@ class ChannelBot(discord.Client):
                     if not self.enabled_channels:
                         continue
 
+                    # Prevent log text from closing the Discord code block.
                     text = line.replace("```", "'''") + "\n"
 
+                    # Split long lines to keep Discord messages small.
                     for start in range(0, len(text), 1800):
                         await self.log_queue.put(
                             text[start:start + 1800]
@@ -289,6 +286,7 @@ class ChannelBot(discord.Client):
             )
             pending = None
 
+            # Batch nearby lines rather than sending one message per line.
             await asyncio.sleep(2)
             await self.wait_until_ready()
 
@@ -315,10 +313,6 @@ class ChannelBot(discord.Client):
                         channel,
                         (discord.TextChannel, discord.Thread),
                     ):
-                        continue
-
-                    # Also check destinations loaded from the saved file.
-                    if channel.guild.id != DISCORD_GUILD_ID:
                         continue
 
                     await channel.send(
@@ -363,9 +357,9 @@ bot = ChannelBot()
 # ---------------- Enable / disable ----------------
 
 async def update_channel(interaction, enable):
-    if interaction.channel_id is None:
+    if interaction.guild_id is None or interaction.channel_id is None:
         await interaction.response.send_message(
-            "Run this in a server channel.",
+            "Run this command in a Discord server channel.",
             ephemeral=True,
         )
         return
@@ -424,6 +418,34 @@ async def disable(interaction: discord.Interaction):
 
 # ---------------- Start / stop ----------------
 
+async def request_power(interaction, signal):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await bot.set_power(signal)
+    except PanelError as error:
+        await interaction.followup.send(
+            str(error),
+            ephemeral=True,
+        )
+        return
+
+    logger.info(
+        "%s requested by Discord user %s in server %s",
+        signal.upper(),
+        interaction.user.id,
+        interaction.guild_id,
+    )
+
+    message = (
+        "Start request accepted. Watch the logs for startup progress."
+        if signal == "start"
+        else "Graceful stop request accepted. Watch the logs for shutdown progress."
+    )
+
+    await interaction.followup.send(message, ephemeral=True)
+
+
 @bot.tree.command(
     name="start",
     description="Start the Minecraft server.",
@@ -432,23 +454,7 @@ async def disable(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 async def start(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        await bot.set_power("start")
-    except PanelError as error:
-        await interaction.followup.send(str(error), ephemeral=True)
-        return
-
-    logger.info(
-        "START requested by Discord user %s",
-        interaction.user.id,
-    )
-
-    await interaction.followup.send(
-        "Start request accepted. Watch the logs for startup progress.",
-        ephemeral=True,
-    )
+    await request_power(interaction, "start")
 
 
 @bot.tree.command(
@@ -469,23 +475,7 @@ async def stop(interaction: discord.Interaction, confirm: bool):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        await bot.set_power("stop")
-    except PanelError as error:
-        await interaction.followup.send(str(error), ephemeral=True)
-        return
-
-    logger.info(
-        "STOP requested by Discord user %s",
-        interaction.user.id,
-    )
-
-    await interaction.followup.send(
-        "Graceful stop request accepted. Watch the logs for shutdown progress.",
-        ephemeral=True,
-    )
+    await request_power(interaction, "stop")
 
 
 # ---------------- Command errors ----------------
@@ -495,7 +485,7 @@ async def command_error(interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         message = "You do not have permission to use this command."
     elif isinstance(error, app_commands.NoPrivateMessage):
-        message = "Run this command in the configured Discord server."
+        message = "Run this command in a Discord server."
     else:
         logger.error(
             "Discord command failed",
@@ -515,11 +505,6 @@ async def command_error(interaction, error):
 # ---------------- Startup ----------------
 
 if __name__ == "__main__":
-    if not DISCORD_GUILD_ID:
-        raise SystemExit(
-            "Set DISCORD_GUILD_ID to your Discord server ID."
-        )
-
     if not TOKEN_FILE.exists():
         raise SystemExit(f"Missing Discord token file: {TOKEN_FILE}")
 
