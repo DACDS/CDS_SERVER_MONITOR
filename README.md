@@ -1,6 +1,6 @@
 # CDS Server Monitor
 
-### Notice: project uses HTTP thus should only be used local
+### Notice: project uses HTTP thus should only be used local (for now)
 
 A Discord bot for monitoring and controlling a Pterodactyl-managed Minecraft server.
 
