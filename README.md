@@ -1,5 +1,7 @@
 # CDS Server Monitor
 
+### Project uses HTTP thus should only be used local
+
 A Discord bot for monitoring and controlling a Pterodactyl-managed Minecraft server.
 
 The bot displays a dashboard that updates in place instead of posting every Minecraft log line as a separate message. All Discord commands require Administrator permission.
