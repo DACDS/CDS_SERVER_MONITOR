@@ -7,6 +7,11 @@ A Discord bot for monitoring and controlling a Pterodactyl-managed Minecraft ser
 
 The bot displays a dashboard that updates in place instead of posting every Minecraft log line as a separate message. All Discord commands require Administrator permission.
 
+## AI Use Notice
+
+This project was developed with **AI-assisted** code generation, documentation, and troubleshooting. however was reviewed by a human.
+(but you know still be careful random with niche repos)
+
 ## Features
 
 - Automatically edited dashboard, refreshed approximately every 15 seconds.
@@ -22,11 +27,6 @@ The bot displays a dashboard that updates in place instead of posting every Mine
 - Persistent dashboard channel and message settings.
 - Separate files for the Discord token and Pterodactyl client API key.
 - Docker Compose deployment with a read-only Minecraft log mount.
-
-## AI Use Notice
-
-This project was developed with **AI-assisted** code generation, documentation, and troubleshooting. however was reviewed by a human.
-(but you know still be careful random with niche repos)
 
 ## Requirements
 
