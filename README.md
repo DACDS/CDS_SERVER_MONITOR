@@ -1,4 +1,5 @@
 # CDS Server Monitor
+This project is not an official Discord, Minecraft, Pterodactyl, Spark, or DURW product.
 
 ### Notice: project uses HTTP thus should only be used local (for now)
 
@@ -24,11 +25,8 @@ The bot displays a dashboard that updates in place instead of posting every Mine
 
 ## AI Use Notice
 
-This project was developed with **AI-assisted** code generation, documentation, and troubleshooting.
-
-AI-generated contributions may contain bugs, incomplete assumptions, or security issues. Review the code and configuration before deployment. Test changes on a non-production server, maintain backups, and do not treat the dashboard as a guaranteed monitoring or alerting system.
-
-This project is not an official Discord, Minecraft, Pterodactyl, Spark, or DURW product.
+This project was developed with **AI-assisted** code generation, documentation, and troubleshooting. however was reviewed by a human.
+(but you know still be careful random niche repos)
 
 ## Requirements
 
