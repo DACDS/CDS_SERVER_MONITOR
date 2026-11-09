@@ -26,7 +26,7 @@ The bot displays a dashboard that updates in place instead of posting every Mine
 ## AI Use Notice
 
 This project was developed with **AI-assisted** code generation, documentation, and troubleshooting. however was reviewed by a human.
-(but you know still be careful random niche repos)
+(but you know still be careful random with niche repos)
 
 ## Requirements
 
